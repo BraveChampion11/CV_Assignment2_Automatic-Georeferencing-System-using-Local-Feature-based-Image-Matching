@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+cache/
+# instructor-provided dataset (large) - remove these lines if you want it in the repo
+reference.tif
+aerial*.png
+data/
