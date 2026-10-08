@@ -5,3 +5,7 @@ cache/
 reference.tif
 aerial*.png
 data/
+reference*.tif
+dataset/
+cache/
+ 

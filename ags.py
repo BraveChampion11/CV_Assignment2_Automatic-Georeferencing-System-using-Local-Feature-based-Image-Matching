@@ -338,7 +338,7 @@ class MainWindow(QtWidgets.QMainWindow):
         files = []
         for e in exts:
             files += glob.glob(os.path.join(d, e))
-        files = [f for f in files if os.path.basename(f).lower() not in ("reference.tif", "reference.tiff")]
+        files = [f for f in files if not os.path.basename(f).lower().startswith("reference")]
         nat = lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", os.path.basename(s))]
         self.aerial_paths = sorted(files, key=nat)
         self.cmb_img.blockSignals(True)
@@ -508,10 +508,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ auto-load
     def autoload(self):
-        for d in (HERE, os.path.join(HERE, "data"), os.getcwd()):
-            ref = os.path.join(d, "reference.tif")
-            if os.path.exists(ref):
-                self.load_reference(ref)
+        for d in (HERE, os.path.join(HERE, "dataset"), os.path.join(HERE, "data"), os.getcwd()):
+            refs = sorted(glob.glob(os.path.join(d, "reference*.tif*")))
+            if refs:
+                self.load_reference(refs[0])
+                break
+        for d in (os.path.join(HERE, "dataset"), os.path.join(HERE, "data"), HERE):
+            if glob.glob(os.path.join(d, "aerial*")):
                 self.load_folder(d)
                 return
 
