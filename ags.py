@@ -45,29 +45,39 @@ MIN_INLIERS = 12        # below this the match is considered unreliable
 # --------------------------------------------------------------------------------------
 # Feature extraction / matching (steps 3 and 4)
 # --------------------------------------------------------------------------------------
-def available_methods():
-    methods = ["SIFT", "AKAZE", "ORB", "BRISK"]
-    try:
-        cv2.xfeatures2d.SURF_create()
-        methods.insert(1, "SURF")      # only in opencv-contrib builds with nonfree enabled
-    except Exception:
-        pass
-    return methods
+def _make(name, *args, **kwargs):
+    """cv2.<Name>_create(...) (OpenCV 4) or cv2.<Name>.create(...) (OpenCV 5)."""
+    f = getattr(cv2, name + "_create", None)
+    if f is None:
+        f = getattr(cv2, name).create
+    return f(*args, **kwargs)
 
 
 def create_detector(method):
     """Returns (detector, matcher norm)."""
     if method == "SIFT":
-        return cv2.SIFT_create(), cv2.NORM_L2
+        return _make("SIFT"), cv2.NORM_L2
     if method == "SURF":
         return cv2.xfeatures2d.SURF_create(400), cv2.NORM_L2
     if method == "AKAZE":
-        return cv2.AKAZE_create(), cv2.NORM_HAMMING
+        return _make("AKAZE"), cv2.NORM_HAMMING
     if method == "ORB":
-        return cv2.ORB_create(nfeatures=20000, fastThreshold=5), cv2.NORM_HAMMING
+        return _make("ORB", nfeatures=20000, fastThreshold=5), cv2.NORM_HAMMING
     if method == "BRISK":
-        return cv2.BRISK_create(), cv2.NORM_HAMMING
+        return _make("BRISK"), cv2.NORM_HAMMING
     raise ValueError(method)
+
+
+def available_methods():
+    """Only the methods that this OpenCV build can actually create."""
+    ok = []
+    for m in ("SIFT", "SURF", "AKAZE", "ORB", "BRISK"):
+        try:
+            create_detector(m)
+            ok.append(m)
+        except Exception:
+            pass
+    return ok
 
 
 def extract_features(gray, method, max_dim):
@@ -100,22 +110,43 @@ def reference_features(ref_path, gray, method):
     return data
 
 
+def knn_match(da, dr, norm, chunk=50000):
+    """2-nearest-neighbour matching. BFMatcher refuses more than 65535 train descriptors,
+    so the reference descriptors are processed in chunks and the best two are merged."""
+    bf = cv2.BFMatcher(norm)
+    dist = np.full((len(da), 2), np.inf, np.float32)
+    idx = np.zeros((len(da), 2), np.int64)
+    for s in range(0, len(dr), chunk):
+        part = dr[s:s + chunk]
+        if len(part) < 2:
+            continue
+        ms = bf.knnMatch(da, part, k=2)
+        d = np.array([[p[0].distance, p[1].distance] if len(p) == 2 else [np.inf, np.inf] for p in ms], np.float32)
+        i = np.array([[p[0].trainIdx + s, p[1].trainIdx + s] if len(p) == 2 else [0, 0] for p in ms], np.int64)
+        alld = np.concatenate([dist, d], axis=1)
+        alli = np.concatenate([idx, i], axis=1)
+        order = np.argsort(alld, axis=1)[:, :2]
+        dist = np.take_along_axis(alld, order, axis=1)
+        idx = np.take_along_axis(alli, order, axis=1)
+    return dist, idx
+
+
 def estimate_homography(pa, da, pr, dr, method):
     """Ratio-test matching + RANSAC homography mapping aerial -> reference."""
-    if da is None or dr is None:
+    if da is None or dr is None or len(da) < 2 or len(dr) < 2:
         return None
     _, norm = create_detector(method)
-    knn = cv2.BFMatcher(norm).knnMatch(da, dr, k=2)
-    good = [p[0] for p in knn if len(p) == 2 and p[0].distance < RATIO * p[1].distance]
-    if len(good) < 4:
+    dist, idx = knn_match(da, dr, norm)
+    keep = np.where(dist[:, 0] < RATIO * dist[:, 1])[0]          # Lowe ratio test
+    if len(keep) < 4:
         return None
-    src = np.float32([pa[m.queryIdx] for m in good]).reshape(-1, 1, 2)
-    dst = np.float32([pr[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+    src = pa[keep].reshape(-1, 1, 2).astype(np.float32)
+    dst = pr[idx[keep, 0]].reshape(-1, 1, 2).astype(np.float32)
     H, mask = cv2.findHomography(src, dst, cv2.RANSAC, RANSAC_THRESH, maxIters=10000, confidence=0.995)
     if H is None:
         return None
     mask = mask.ravel().astype(bool)
-    return dict(H=H, n_good=len(good), n_inl=int(mask.sum()),
+    return dict(H=H, n_good=len(keep), n_inl=int(mask.sum()),
                 src=src[mask].reshape(-1, 2), dst=dst[mask].reshape(-1, 2))
 
 
@@ -492,12 +523,27 @@ class MainWindow(QtWidgets.QMainWindow):
                          "{:.7f}".format(lat), "{:.7f}".format(lon), res["n_inl"]])
 
     def show_matches(self):
-        res = self.current_result()
-        if res is None:
+        if self.ref is None or self.aerial is None:
+            QtWidgets.QMessageBox.information(self, "AGS", "Load the reference and an aerial image first.")
+            return
+        res = self.current_result()       # None when the match is unreliable (< MIN_INLIERS)
+        reliable = res is not None
+        if res is None:                   # still show what was found, so failures can be inspected
+            method = self.cmb_method.currentText()
+            found = [r for (p, m, k), r in self.cache.items()
+                     if p == self.aerial_path and m == method and r is not None]
+            if found:
+                res = max(found, key=lambda r: r["n_inl"])
+        if res is None or len(res["src"]) == 0:
+            QtWidgets.QMessageBox.information(
+                self, "AGS", "No matches were found for this image and method, so there is nothing to draw.\n"
+                             "Try another method or rotation.")
             return
         vis = draw_matches(self.aerial, self.ref.rgb, res["src"], res["dst"])
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("RANSAC inlier matches ({} inliers)".format(res["n_inl"]))
+        self.match_dlg = QtWidgets.QDialog(self)      # keep a reference so the window is not garbage-collected
+        dlg = self.match_dlg
+        dlg.setWindowTitle("RANSAC inlier matches ({} inliers){}".format(
+            res["n_inl"], "" if reliable else "  -  UNRELIABLE, below {} inliers".format(MIN_INLIERS)))
         lab = QtWidgets.QLabel()
         lab.setPixmap(to_pixmap(vis))
         sc = QtWidgets.QScrollArea()
@@ -505,6 +551,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QVBoxLayout(dlg).addWidget(sc)
         dlg.resize(1400, 800)
         dlg.show()
+        dlg.raise_()
 
     # ------------------------------------------------------------------ auto-load
     def autoload(self):
